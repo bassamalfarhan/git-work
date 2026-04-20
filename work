@@ -1,0 +1,714 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Bassam Alfarhan
+
+# Load .env only from the same directory as this script (the tooling checkout).
+_WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${_WORK_DIR}/.env" ]]; then
+    # shellcheck source=/dev/null
+    source "${_WORK_DIR}/.env"
+else
+    printf >&2 "work: .env not found. Expected %s/.env (copy from .env.template)\n" "${_WORK_DIR}" >&2
+    exit 1
+fi
+
+# Main repo path (legacy: CODE_PATH). Prefer MAIN_PATH going forward.
+MAIN_PATH="${MAIN_PATH:-${CODE_PATH:-}}"
+if [[ -z "${MAIN_PATH}" ]]; then
+    printf >&2 "work: MAIN_PATH is not set (rename CODE_PATH -> MAIN_PATH in .env)\n" >&2
+    exit 1
+fi
+
+# Keyword to jump to MAIN_PATH (main clone); override in .env (e.g. main, master, code)
+WORK_MAIN_ALIAS="${WORK_MAIN_ALIAS:-main}"
+# Prefix used to identify release branches (e.g. release, rel); override in .env
+RELEASE_PREFIX="${RELEASE_PREFIX:-release}"
+if [[ -z ${PROJ_PREFIXES:-} && -z ${PROJ_PREFIX:-} ]]; then
+    printf >&2 "work: set PROJ_PREFIX or PROJ_PREFIXES in .env\n" >&2
+    exit 1
+fi
+# Support multiple project keys (ERE alternation). If PROJ_PREFIXES is unset/empty, fall back to PROJ_PREFIX.
+if [[ -n ${PROJ_PREFIXES:-} ]]; then
+    _PROJ_KEYS="${PROJ_PREFIXES}"
+else
+    _PROJ_KEYS="${PROJ_PREFIX}"
+fi
+PROJ_ISSUE_ID_REGEX="(${_PROJ_KEYS})[0-9]+"
+PROJ_ISSUE_BRANCH_PREFIX_REGEX="^(${_PROJ_KEYS})[0-9]"
+
+# Directory of post-checkout/create hooks: relative paths are under this tooling checkout (_WORK_DIR); absolute paths are used as-is.
+WORK_POST_WORKTREE_DIR="${WORK_POST_WORKTREE_DIR:-.work/post-worktree.d}"
+
+function _worktree_post_hook {
+    local wt_root="$1"
+    local reason="$2"
+
+    [[ -d "$wt_root" ]] || return 0
+    [[ -n "${WORK_POST_WORKTREE_DIR:-}" ]] || return 0
+
+    local hook_dir
+    if [[ "${WORK_POST_WORKTREE_DIR}" == /* ]]; then
+        hook_dir="${WORK_POST_WORKTREE_DIR}"
+    else
+        hook_dir="${_WORK_DIR}/${WORK_POST_WORKTREE_DIR}"
+    fi
+    hook_dir="${hook_dir%/}"
+    [[ -d "$hook_dir" ]] || return 0
+
+    export WORK_WORKTREE_PATH="$wt_root"
+    export WORK_HOOK_REASON="$reason"
+
+    local hook_st=0
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        [[ -f "$f" ]] || continue
+        # Skip dotfiles (e.g. .gitkeep) and non-hook noise
+        [[ "$(basename "$f")" != .* ]] || continue
+
+        if [[ -x "$f" ]]; then
+            printf "Running post-worktree hook (%s): %s\n" "$reason" "$f"
+            ( cd "$wt_root" && "$f" ) || hook_st=$?
+        elif [[ "$f" == *.sh ]]; then
+            printf "Running post-worktree hook (%s): %s\n" "$reason" "$f"
+            ( cd "$wt_root" && bash "$f" ) || hook_st=$?
+        fi
+    done < <(find "$hook_dir" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | LC_ALL=C sort)
+
+    if [[ $hook_st -ne 0 ]]; then
+        printf >&2 "work: one or more post-worktree hooks failed (exit %s); worktree was added successfully\n" "$hook_st"
+    fi
+    return 0
+}
+
+function _install_bashrc_work_function {
+    local rc="${WORK_BASHRC:-${HOME}/.bashrc}"
+    local marker_begin='# >>>>>> work-git-work'
+    local marker_end='# <<<<<< work-git-work'
+    local real_script="${_WORK_DIR}/work"
+    local escaped_script
+    escaped_script=$(printf '%q' "$real_script")
+
+    if [[ ! -f "$real_script" ]]; then
+        printf >&2 "work init: cannot install bashrc snippet (missing %s)\n" "$real_script"
+        return 1
+    fi
+
+    touch "$rc" || return 1
+
+    local filtered="${rc}.work-init.$$.tmp"
+    local in_block=0
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$marker_begin" ]]; then
+            in_block=1
+            continue
+        fi
+        if [[ "$line" == "$marker_end" ]]; then
+            in_block=0
+            continue
+        fi
+        [[ "$in_block" -eq 1 ]] && continue
+        printf '%s\n' "$line"
+    done <"$rc" >"$filtered" || return 1
+    mv "$filtered" "$rc" || {
+        rm -f "$filtered"
+        return 1
+    }
+
+    {
+        echo "$marker_begin"
+        echo "# Managed by work init — re-run init after moving this checkout."
+        echo "_WORK_SCRIPT=${escaped_script}"
+        cat <<'WKEOF'
+work() {
+    : >/tmp/last_worktree_path_goto
+    if [[ ! -f "${_WORK_SCRIPT}" ]]; then
+        printf >&2 "work: not found at %s\n" "${_WORK_SCRIPT}"
+        return 127
+    fi
+    bash "${_WORK_SCRIPT}" "$@"
+    eval "$(cat /tmp/last_worktree_path_goto 2>/dev/null)"
+}
+WKEOF
+        echo "$marker_end"
+    } >>"$rc" || return 1
+
+    printf "\nInstalled work() in %s — open a new terminal or run: source %q\n\n" "$rc" "$rc"
+}
+
+function _init {
+    mkdir -p "${BRANCHES_PATH}" || {
+        printf >&2 "work init: could not create BRANCHES_PATH %q\n" "${BRANCHES_PATH}"
+        exit 1
+    }
+
+    local clone_st=0
+    local attempted_clone=0
+
+    if [[ -d "${MAIN_PATH}" ]] && git -C "${MAIN_PATH}" rev-parse --is-inside-work-tree &>/dev/null; then
+        printf "work init: main repo already present at %s — skipping git clone\n" "${MAIN_PATH}"
+    elif [[ ! -e "${MAIN_PATH}" ]]; then
+        mkdir -p "${MAIN_PATH}" || {
+            printf >&2 "work init: could not create MAIN_PATH %q\n" "${MAIN_PATH}"
+            exit 1
+        }
+        attempted_clone=1
+        git clone "${GIT_REPO}" "${MAIN_PATH}" || clone_st=$?
+    elif [[ -d "${MAIN_PATH}" ]] && [[ -z "$(find "${MAIN_PATH}" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]; then
+        attempted_clone=1
+        git clone "${GIT_REPO}" "${MAIN_PATH}" || clone_st=$?
+    else
+        printf >&2 "work init: MAIN_PATH %q exists but is not a git repository, or it is not empty. Leaving it unchanged.\n" "${MAIN_PATH}"
+        exit 1
+    fi
+
+    _install_bashrc_work_function || exit $?
+    if [[ $attempted_clone -eq 1 ]]; then
+        [[ $clone_st -eq 0 ]] || exit $clone_st
+    fi
+}
+
+# Single-letter status for bare `work` listing: [M] modified, [A] ahead of upstream, [B] both, [C] clean.
+function _worktree_list_suffix {
+    local wt="$1"
+    local modified=0 ahead=0 cnt
+
+    if ! git -C "$wt" rev-parse --is-inside-work-tree &>/dev/null; then
+        printf '%s\n' C
+        return 0
+    fi
+
+    if [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]]; then
+        modified=1
+    fi
+
+    if git -C "$wt" rev-parse -q --verify '@{u}' &>/dev/null; then
+        cnt=$(git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null) || cnt=0
+        if [[ "$cnt" =~ ^[0-9]+$ ]] && [[ "$cnt" -gt 0 ]]; then
+            ahead=1
+        fi
+    fi
+
+    if [[ $modified -eq 1 && $ahead -eq 1 ]]; then
+        printf '%s\n' B
+    elif [[ $modified -eq 1 ]]; then
+        printf '%s\n' M
+    elif [[ $ahead -eq 1 ]]; then
+        printf '%s\n' A
+    else
+        printf '%s\n' C
+    fi
+}
+
+function _work_print_branch_line {
+    local name="$1"
+    local wt="${BRANCHES_PATH}/${name}"
+    local suf
+    suf="$(_worktree_list_suffix "$wt")"
+    printf '\t%s [%s]\n' "$name" "$suf"
+}
+
+function _work {
+    cd "${BRANCHES_PATH}" || exit 1
+
+    cmd="$1"
+    branch_name="$(find . -maxdepth 1 -type d | grep '-' | grep "$cmd" | sort -V | sed -e 's/^.\///' -e 's/[[:space:]]*$//')"
+    res_count=$(grep -cve '^$' <<< "$branch_name" || true)
+    if [[ -z $cmd ]]; then 
+
+        echo "Checked out branches ($res_count):"; echo ""
+        printf "\t%s\n" "[M] modified working tree  [A] ahead of upstream  [B] both  [C] clean"
+        echo ""
+
+        printf "\t%s\n" "ISSUES:"
+        while IFS= read -r _b || [[ -n "${_b}" ]]; do
+            [[ -z "${_b}" ]] && continue
+            _work_print_branch_line "${_b}"
+        done < <(echo "$branch_name" | grep -E "${PROJ_ISSUE_BRANCH_PREFIX_REGEX}")
+
+        echo ""
+
+        printf "\t%s\n" "RELEASES:"
+        while IFS= read -r _b || [[ -n "${_b}" ]]; do
+            [[ -z "${_b}" ]] && continue
+            _work_print_branch_line "${_b}"
+        done < <(echo "$branch_name" | grep -E "^${RELEASE_PREFIX}")
+
+        echo ""
+
+        printf "\t%s\n" "OTHER:"
+        while IFS= read -r _b || [[ -n "${_b}" ]]; do
+            [[ -z "${_b}" ]] && continue
+            _work_print_branch_line "${_b}"
+        done < <(echo "$branch_name" | grep -Ev "^${RELEASE_PREFIX}" | grep -Ev "${PROJ_ISSUE_BRANCH_PREFIX_REGEX}")
+
+        printf "\n\t%s\n\n" "For the base branch type ${WORK_MAIN_ALIAS}"
+    elif [[ $cmd = "${WORK_MAIN_ALIAS}" ]]; then 
+        echo "cd ${MAIN_PATH}" > /tmp/last_worktree_path_goto
+    elif [[ $res_count = 0 ]]; then 
+        echo "Lookup word didn't match any issues."
+    elif [[ $res_count = 1 ]]; then
+        echo "cd ${BRANCHES_PATH}/${branch_name}" > /tmp/last_worktree_path_goto
+    else
+        echo "Ambiguous lookup word, matching ($res_count) issues."; echo ""
+        while IFS= read -r _b || [[ -n "${_b}" ]]; do
+            [[ -z "${_b}" ]] && continue
+            _work_print_branch_line "${_b}"
+        done < <(echo "$branch_name")
+        echo ""
+    fi
+}
+
+function _checkout {
+    cd "${MAIN_PATH}" || exit 1
+
+    issue_id="$1" 
+
+    echo "Fetching from origin..."
+    git fetch
+    echo ""
+    echo ""
+
+    echo "Listing available / matching branches"
+    echo ""
+
+    echo "ISSUES:"
+    echo ""
+    git branch -a \
+        | grep remotes \
+        | sed -e 's/^[[:space:]]*//' -e 's#^remotes/origin/##' \
+        | grep -E "${PROJ_ISSUE_BRANCH_PREFIX_REGEX}" \
+        | grep "$issue_id" \
+        | sort -V \
+        | xargs printf "\t%s\n"
+    echo ""
+
+    echo "RELEASES:"
+    echo ""
+    git branch -a \
+        | grep remotes \
+        | sed -e 's/^[[:space:]]*//' -e 's#^remotes/origin/##' \
+        | grep -E "^${RELEASE_PREFIX}" \
+        | grep "$issue_id" \
+        | sort -V \
+        | xargs printf "\t%s\n"
+    echo ""
+
+    echo "OTHER:"
+    echo ""
+    git branch -a \
+        | grep remotes \
+        | sed -e 's/^[[:space:]]*//' -e 's#^remotes/origin/##' \
+        | grep -Ev "${PROJ_ISSUE_BRANCH_PREFIX_REGEX}" \
+        | grep -Ev "^${RELEASE_PREFIX}" \
+        | grep "$issue_id" \
+        | sort -V \
+        | xargs printf "\t%s\n"
+    echo ""
+
+
+    branch_count=$(git branch -a | grep "$issue_id" | grep -c 'remotes' || true)
+    # Avoid echo -e: it can interpret escapes and trigger warnings on some setups.
+    branch_name="$(git branch -a | grep remotes | grep "$issue_id" | head -1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+    if [[ ! $branch_count = 1 ]]; then
+        branch_check=$(git branch -a | grep "$issue_id" | grep -cve 'remotes' || true)
+        if [[ $branch_check != 1 ]]; then
+            printf >&2 "Branch (%s) is already checked out.\n" "$branch_name"
+        elif [[ $branch_check == 0 ]]; then
+            printf >&2 "Looks like there are no matching branches.\n"
+        else
+            printf >&2 "Search phrase mached more than one branch, please be more specific.\n"
+        fi
+        exit 1
+    fi
+
+    branch_name=${branch_name#remotes/origin/}
+
+    # Use the full branch name as the worktree folder name (prevents truncation when grep matches mid-name)
+    worktree_folder="$branch_name"
+
+    echo ""
+    echo "Will run the following in ($(pwd)):"
+    echo ""
+    printf "\t%s\n" "git worktree add ${BRANCHES_PATH}/${worktree_folder} ${branch_name}"
+    echo ""
+
+    while true; do
+        read -p "Does it look OK? (y/n): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if ! git worktree add "${BRANCHES_PATH}/${worktree_folder}" "$branch_name"; then
+                printf >&2 "Failed to add worktree.\n"
+                exit 1
+            fi
+            _worktree_post_hook "${BRANCHES_PATH}/${worktree_folder}" "checkout"
+            if [[ "${AUTO_CD_AFTER_CHECKOUT}" == "true" ]]; then
+                echo "cd ${BRANCHES_PATH}/${worktree_folder}" > /tmp/last_worktree_path_goto
+            fi
+            exit 0;
+        elif [[ $REPLY =~ ^[Nn]$ ]]; then
+            echo 'Exiting without doing anything.'
+            exit 0;
+        else
+            echo "Please answer either (y)es or (n)o."
+            echo ""
+        fi
+    done
+
+}
+
+function _close {
+    # -f / --force are equivalent; valid at the start of args or right after the optional issue grep string.
+    force_close=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force)
+                force_close="-f"
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    issue_id="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    while [[ "$1" == "-f" || "$1" == "--force" ]]; do
+        force_close="-f"
+        shift
+    done
+
+    if [[ $# -gt 0 ]]; then
+        printf >&2 "work close: unexpected argument '%s'\n" "$1"
+        exit 1
+    fi
+
+    if [[ -z $issue_id ]]; then
+        # Use current branch - get branch and path before any cd
+        branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        delete_path=$(git rev-parse --show-toplevel 2>/dev/null)
+        if [[ -z $branch_name || $branch_name == "HEAD" ]]; then
+            printf >&2 "Not in a branch (detached HEAD?). Cannot close.\n"
+            exit 1
+        fi
+        if [[ -z $delete_path ]]; then
+            printf >&2 "Not in a git repository. Cannot close.\n"
+            exit 1
+        fi
+        if [[ "$delete_path" == "${MAIN_PATH}" ]]; then
+            printf >&2 "Cannot close main repository. Specify a branch to close.\n"
+            exit 1
+        fi
+        if [[ "$delete_path" != "${BRANCHES_PATH}"* ]]; then
+            printf >&2 "Current directory is not a worktree under BRANCHES_PATH. Run from within a worktree or specify a branch.\n"
+            exit 1
+        fi
+    else
+        cd "${BRANCHES_PATH}" || exit 1
+        branch_name="$(find . -maxdepth 1 -type d | grep '-' | grep "$issue_id" | sort -V | sed -e 's/^.\///' -e 's/[[:space:]]*$//')"
+        res_count=$(grep -cve '^$' <<< "$branch_name" || true)
+
+        if [[ $res_count = 0 ]]; then
+            echo "Lookup word didn't match any issues."
+            exit 1
+        elif [[ $res_count -gt 1 ]]; then
+            echo "Ambiguous lookup word, matching ($res_count) issues."; echo ""
+            _work
+            exit 1
+        fi
+        cd "${MAIN_PATH}" || exit 1
+        delete_path=$(git worktree list | grep "$branch_name" | awk '{print $1}')
+    fi
+
+    cd "${MAIN_PATH}" || exit 1
+
+    echo "Will run the following: "
+        printf "\n\t%s\n\n" "git worktree remove ${force_close} ${delete_path}"
+
+        if [[ -n $force_close ]]; then
+            echo "!!!WARNING!!!: Force removal (-f/--force)"
+        fi
+
+        echo; 
+        while true; do
+            read -p "Does it look OK? (y/n): " -n 1 -r
+            echo;
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                remove_ok=0
+                if [[ -n $force_close ]]; then
+                    git worktree remove -f "$delete_path" || remove_ok=$?
+                else
+                    git worktree remove "$delete_path" || remove_ok=$?
+                fi
+
+                #echo $remove_ok
+                #128 = fatal dirty
+                #0 = OK
+
+                if [[ $remove_ok -ne 0 ]]; then
+                    echo "Opening branch for inspection..."
+                    echo "cd ${delete_path}" > /tmp/last_worktree_path_goto
+                else
+                    git worktree prune
+                    echo "cd ${MAIN_PATH}" > /tmp/last_worktree_path_goto
+                fi
+                exit 0;
+            elif [[ $REPLY =~ ^[Nn]$ ]]; then
+                echo 'Exiting without doing anything.'
+                exit 0;
+            else
+                echo "Please answer either (y)es or (n)o."
+            fi
+        done
+}
+
+function _commit {
+    current_branch=$(pwd)
+    message="$*"
+
+    if [[ $current_branch =~ .*?(${PROJ_ISSUE_ID_REGEX}).* ]]; then
+        issue_id=${BASH_REMATCH[1]}
+    else
+        printf >&2 '%s\n' "Couldn't find any issue id in ($current_branch)"
+    fi
+
+    if [[ -z $message ]]; then
+        printf >&2 "Usage: work --commit <message>\n<message> can not be empty.\n"
+    fi
+
+    if [[ -z $issue_id || -z $message ]]; then
+        echo 'Exiting without doing anything.'
+    else
+        commit_message="$issue_id $message"
+        printf "Using '%s' as issue id.\n\nHere's the commit message:\n\n\t'%s'\n\n" "$issue_id" "$commit_message"
+        read -p "Does it look OK? (y/n): " -n 1 -r
+        echo; echo;
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            #echo "$commit_message"
+        git commit -m "$commit_message"
+        else
+            echo 'Exiting without doing anything.'
+        fi
+    fi
+}
+
+function _details {
+    issue_grep="$1"
+
+    if [[ -z $issue_grep ]]; then
+        branch_name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [[ -z $branch_name || $branch_name == "HEAD" ]]; then
+            printf >&2 "Not on a branch (detached HEAD?). Specify an issue grep or run from a feature branch.\n"
+            exit 1
+        fi
+    else
+        cd "${BRANCHES_PATH}" || exit 1
+        branch_name="$(find . -maxdepth 1 -type d | grep '-' | grep "$issue_grep" | sort -V | sed -e 's/^.\///' -e 's/[[:space:]]*$//')"
+        res_count=$(grep -cve '^$' <<< "$branch_name" || true)
+
+        if [[ $res_count = 0 ]]; then
+            echo "Lookup word didn't match any issues."
+            exit 1
+        elif [[ $res_count -gt 1 ]]; then
+            echo "Ambiguous lookup word, matching ($res_count) issues."; echo ""
+            echo "$branch_name" | xargs printf "\t%s\n"; echo ""
+            exit 1
+        fi
+    fi
+
+    if [[ $branch_name =~ (${PROJ_ISSUE_ID_REGEX}) ]]; then
+        extracted_id=${BASH_REMATCH[1]}
+        jira_url="${JIRA_BASE}${extracted_id}"
+        echo "Opening JIRA issue: $extracted_id"
+        echo "URL: $jira_url"
+        xdg-open "$jira_url"
+    else
+        printf >&2 "Could not extract issue ID from branch: %s\n" "$branch_name"
+        exit 1
+    fi
+}
+
+function _create {
+    branch_name="$1"
+    base_branch="$2"
+
+    if [[ -z $branch_name ]]; then
+        printf >&2 "Usage: work --create <branch-name> [--base <base-branch>]\n"
+        exit 1
+    fi
+
+    if [[ -z $base_branch ]]; then
+        # Try to detect current branch from the user's working directory
+        base_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [[ -z $base_branch || $base_branch == "HEAD" ]]; then
+            base_branch="main"
+        fi
+    fi
+
+    cd "${MAIN_PATH}" || exit 1
+
+    branch_exists=false
+    if git show-ref --verify --quiet "refs/heads/${branch_name}"; then
+        branch_exists=true
+    fi
+
+    echo ""
+    echo "Will create new branch"
+    echo ""
+    printf "\tBranch:  %s\n" "$branch_name"
+    printf "\tBase:    %s\n" "$base_branch"
+    echo ""
+    if [[ $branch_exists == true ]]; then
+        echo "Note: local branch already exists; only a new worktree will be added."
+        echo ""
+        printf "\tgit worktree add %s/%s %s\n" "${BRANCHES_PATH}" "$branch_name" "$branch_name"
+    else
+        printf "\tgit worktree add %s/%s -b %s %s\n" "${BRANCHES_PATH}" "$branch_name" "$branch_name" "$base_branch"
+    fi
+    echo ""
+
+    while true; do
+        read -p "Continue? (y/n): " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if [[ $branch_exists == true ]]; then
+                if ! git worktree add "${BRANCHES_PATH}/${branch_name}" "$branch_name"; then
+                    printf >&2 "Failed to create worktree.\n"
+                    exit 1
+                fi
+            else
+                if ! git worktree add "${BRANCHES_PATH}/${branch_name}" -b "$branch_name" "$base_branch"; then
+                    printf >&2 "Failed to create worktree.\n"
+                    exit 1
+                fi
+            fi
+            _worktree_post_hook "${BRANCHES_PATH}/${branch_name}" "create"
+            if [[ "${AUTO_CD_AFTER_CHECKOUT}" == "true" ]]; then
+                echo "cd ${BRANCHES_PATH}/${branch_name}" > /tmp/last_worktree_path_goto
+            fi
+            exit 0;
+        elif [[ $REPLY =~ ^[Nn]$ ]]; then
+            echo 'Exiting without doing anything.'
+            exit 0;
+        else
+            echo "Please answer either (y)es or (n)o."
+            echo ""
+        fi
+    done
+}
+
+function _push {
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [[ -z $branch || $branch == "HEAD" ]]; then
+        printf >&2 "Not in a branch (detached HEAD?). Cannot push.\n"
+        exit 1
+    fi
+
+    if git rev-parse --abbrev-ref '@{u}' &>/dev/null; then
+        git push
+    else
+        git push -u origin "$branch"
+    fi
+}
+
+function _help {
+    _help_line() {
+        # Align commands and descriptions in two columns.
+        # Keep width reasonably wide for the longest command forms.
+        printf "  %-58s %s\n" "$1" "$2"
+    }
+
+    echo "Usage:"
+    _help_line "work" "List checked-out worktrees with [M]/[A]/[B]/[C] status (see list legend)"
+    _help_line "work [<issue-grep-string>]" "Switch to branch matching the grep string"
+    _help_line "work ${WORK_MAIN_ALIAS}" "Switch to main repo (MAIN_PATH); set WORK_MAIN_ALIAS in .env"
+    _help_line "work --checkout | work checkout <issue-grep-string>" "Add worktree for remote branch"
+    _help_line "work --close | work close [-f|--force] [<issue-grep-string>]" "Remove worktree (-f/--force at start or after grep; omit grep for current branch)"
+    _help_line "work --commit | work commit \"<message>\"" "Commit with issue-id prefixed message"
+    _help_line "work --details | work details [<issue-grep-string>]" "Open JIRA in browser (omit grep to use current branch)"
+    _help_line "work --create | work create <branch-name> [--base <base-branch>]" "Create worktree; creates branch only if it doesn't already exist"
+    _help_line "work --push | work push | work -p" "Push current branch (set upstream if needed)"
+    _help_line "work --init | work init" "Ensure dirs; clone main repo only if missing; refresh work() in ~/.bashrc (WORK_BASHRC)"
+    _help_line "work --help | work -h | work help" "Show this help"
+    echo
+    _help_line "(.env)" "WORK_POST_WORKTREE_DIR — hooks dir: relative to work script dir, or absolute (default .work/post-worktree.d)"
+}
+
+# Subcommands: see _help / work --help
+
+command=""
+case "$1" in
+    --checkout|checkout)
+        command="--checkout"
+        shift
+        ;;
+    --close|close)
+        command="--close"
+        shift
+        ;;
+    --commit|commit)
+        command="--commit"
+        shift
+        ;;
+    --details|details)
+        command="--details"
+        shift
+        ;;
+    --create|create)
+        command="--create"
+        shift
+        ;;
+    --push|push|-p)
+        command="--push"
+        shift
+        ;;
+    --init|init)
+        command="--init"
+        shift
+        ;;
+    --help|-h|help)
+        command="--help"
+        shift
+        ;;
+    "")
+        ;;
+    *)
+        if [[ "$1" == -* ]]; then
+            printf >&2 "work: unknown option or command '%s'\nTry 'work help' or 'work --help'.\n" "$1"
+            exit 1
+        fi
+        ;;
+esac
+
+# Parse --base flag for --create (avoid bare `shift` when no args remain — bash warns/errors)
+if [[ $command == "--create" ]]; then
+    _create_branch="${1:-}"
+    _create_base=""
+    if [[ -n "${1:-}" ]]; then
+        shift
+        if [[ "${1:-}" == "--base" ]]; then
+            if [[ -z "${2:-}" ]]; then
+                printf >&2 "work create: --base requires a branch name\n"
+                exit 1
+            fi
+            _create_base="$2"
+            shift 2
+        fi
+    fi
+fi
+
+case $command in
+  "--checkout") _checkout "$@";;
+  "--close") _close "$@";;
+  "--commit") _commit "$@";;
+  "--details") _details "$@";;
+  "--init") _init "$@";;
+  "--create") _create "$_create_branch" "$_create_base";;
+  "--push") _push;;
+  "--help") _help;;
+  *) _work "$@";;
+esac
+
